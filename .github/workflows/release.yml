@@ -1,0 +1,129 @@
+name: release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GIT_USER_NAME: github-actions[bot]
+  GIT_USER_EMAIL: github-actions[bot]@users.noreply.github.com
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      create: ${{ steps.check.outputs.create }}
+      latest_tag: ${{ steps.check.outputs.latest_tag }}
+      bump: ${{ steps.check.outputs.bump }}
+      new_tag: ${{ steps.check.outputs.new_tag }}
+      release_notes: ${{ steps.check.outputs.release_notes }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: check
+        id: check
+        run: |
+          ./.github/scripts/release/check.sh
+
+      - name: Summary
+        run: |
+          if [[ "${{ steps.check.outputs.create }}" == "true" ]]; then
+            echo "Will create tag: ${{ steps.check.outputs.new_tag }} (bump=${{ steps.check.outputs.bump }})"
+          else
+            echo "No new commits since ${{ steps.check.outputs.latest_tag }}; no release will be created."
+          fi
+
+  create_tag:
+    needs: check
+    if: needs.check.outputs.create == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: create_tag
+        env:
+          NEW_TAG: ${{ needs.check.outputs.new_tag }}
+        run: ./.github/scripts/release/create_tag.sh
+
+  create_notes:
+    needs:
+      - check
+      - create_tag
+    if: needs.check.outputs.create == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: create_notes
+        env:
+          NEW_TAG: ${{ needs.check.outputs.new_tag }}
+          RELEASE_NOTES: ${{ needs.check.outputs.release_notes }}
+          MAX_RELEASES: "15"
+        run: ./.github/scripts/release/update_changelog.sh
+
+      - name: commit_changelog
+        env:
+          NEW_TAG: ${{ needs.check.outputs.new_tag }}
+        run: |
+          git config --global user.email "${{ env.GIT_USER_EMAIL }}"
+          git config --global user.name "${{ env.GIT_USER_NAME }}"
+
+          if git diff --quiet -- CHANGELOG.md; then
+            exit 0
+          fi
+
+          git add CHANGELOG.md
+          git commit -m "chore(changelog): update for ${NEW_TAG} [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: RELEASE_NOTES.md
+          if-no-files-found: error
+
+  release:
+    needs:
+      - check
+      - create_notes
+    if: needs.check.outputs.create == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+
+      - name: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.new_tag }}
+          name: ${{ needs.check.outputs.new_tag }}
+          body_path: RELEASE_NOTES.md
+
+      - name: Summary
+        run: |
+          echo "Created release: ${{ needs.check.outputs.new_tag }} (bump=${{ needs.check.outputs.bump }})"
